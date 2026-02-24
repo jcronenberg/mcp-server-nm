@@ -5,6 +5,7 @@ import struct
 import time
 import asyncio
 import os
+import sys
 from typing import Optional
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import PingRequest, EmptyResult
@@ -101,7 +102,7 @@ class NMTransaction:
                     try:
                         self.manager.CheckpointRollback(self.checkpoint)
                     except Exception as rb_err:
-                        print(f"Failed to rollback: {str(rb_err)}")
+                        print(f"Failed to rollback: {str(rb_err)}", file=sys.stderr)
                 return {"status": "error", "message": "MCP Session unresponsive after change. Changes rolled back."}
 
             new_conn = self.get_connectivity()
