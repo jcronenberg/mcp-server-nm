@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import PingRequest, EmptyResult, ClientCapabilities, ElicitationCapability
 
-# Configure logging to stderr for MCP compatibility
 logging.basicConfig(
     level=logging.INFO,
     format='%(levelname)s: %(name)s - %(message)s'
