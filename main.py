@@ -1,20 +1,24 @@
 import dbus
 import json
-import socket
-import struct
-import time
 import asyncio
 import os
 import sys
-from typing import Optional
+import logging
+from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
-from mcp.types import PingRequest, EmptyResult
+from mcp.types import PingRequest, EmptyResult, ClientCapabilities, ElicitationCapability
+
+# Configure logging to stderr for MCP compatibility
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(name)s - %(message)s'
+)
+logger = logging.getLogger("nm-mcp-server")
 
 mcp = FastMCP(
     "NetworkManager MCP Server",
     host=os.getenv("MCP_HOST", "0.0.0.0"),
-    port=int(os.getenv("MCP_PORT", "8000")),
-    json_response=True
+    port=int(os.getenv("MCP_PORT", "8000"))
 )
 
 DEVICE_TYPES = {
@@ -64,6 +68,9 @@ def get_ip_config_details(bus, path, interface_name):
         return {"addresses": p.get("AddressData", []), "routes": p.get("RouteData", [])}
     except Exception: return {"addresses": [], "routes": []}
 
+class ConnectionConfirm(BaseModel):
+    confirm: bool = Field(alias="Confirm?", title="Confirm?")
+
 class NMTransaction:
     """Helper to handle Checkpoint -> Modify -> Check -> Rollback/Commit flow."""
     def __init__(self, bus, ctx: Context, timeout=60):
@@ -80,14 +87,10 @@ class NMTransaction:
 
     async def run(self, action_fn):
         initial_conn = self.get_connectivity()
-        await self.ctx.info(f"Initial connectivity: {CONNECTIVITY_STATES.get(initial_conn)}")
-
-        await self.ctx.info("Creating NetworkManager checkpoint...")
         devices = self.manager.GetDevices()
         self.checkpoint = self.manager.CheckpointCreate(devices, self.timeout, 1) # 1 = Destroy all other checkpoints
 
         try:
-            await self.ctx.info("Applying changes...")
             await action_fn()
 
             # Wait a bit for changes to propagate/re-activation
@@ -101,19 +104,50 @@ class NMTransaction:
                     try:
                         self.manager.CheckpointRollback(self.checkpoint)
                     except Exception as rb_err:
-                        print(f"Failed to rollback: {str(rb_err)}", file=sys.stderr)
+                        logger.error(f"Failed to rollback: {rb_err}")
                 return {"status": "error", "message": "MCP Session unresponsive after change. Changes rolled back."}
 
             new_conn = self.get_connectivity()
             await self.ctx.info(f"New connectivity: {CONNECTIVITY_STATES.get(new_conn)}")
 
-            self.manager.CheckpointDestroy(self.checkpoint)
-            return {"status": "success", "message": "Changes applied and committed."}
+            if new_conn < initial_conn:
+                # Check if client supports elicitation
+                can_elicit = False
+                try:
+                    can_elicit = self.ctx.session.check_client_capability(
+                        ClientCapabilities(elicitation=ElicitationCapability())
+                    )
+                except Exception:
+                    can_elicit = False
+
+                if can_elicit:
+                    prompt = (f"Warning: Connectivity deteriorated from {CONNECTIVITY_STATES.get(initial_conn)} "
+                              f"to {CONNECTIVITY_STATES.get(new_conn)}. Do you want to keep these changes?")
+                    try:
+                        response = await self.ctx.elicit(message=prompt, schema=ConnectionConfirm)
+                        # Extract confirm from the model instance (which might be in 'data')
+                        data = getattr(response, "data", response)
+                        confirm = getattr(data, "confirm", False)
+                    except Exception as e:
+                        logger.error(f"Failed elicitation request: {e}")
+                        confirm = False
+
+                    if confirm:
+                        self.manager.CheckpointDestroy(self.checkpoint)
+                        return {"status": "success", "message": "Changes committed by user."}
+                    else:
+                        self.manager.CheckpointRollback(self.checkpoint)
+                        return {"status": "rollback", "message": "Changes rolled back due to user declining."}
+                else:
+                    self.manager.CheckpointDestroy(self.checkpoint)
+                    return {"status": "success", "message": f"Changes applied. Warning: Connectivity deteriorated to {CONNECTIVITY_STATES.get(new_conn)}."}
+            else:
+                self.manager.CheckpointDestroy(self.checkpoint)
+                return {"status": "success", "message": "Changes applied and committed."}
 
         except Exception as e:
-            await self.ctx.error(f"Error: {str(e)}")
+            logger.exception(f"Error during NMTransaction: {e}")
             if self.checkpoint:
-                await self.ctx.info("Rolling back...")
                 try: self.manager.CheckpointRollback(self.checkpoint)
                 except Exception: pass
             raise e
@@ -161,7 +195,7 @@ async def get_devices() -> str:
 
 @mcp.tool()
 async def get_connections() -> str:
-    """Gets all configured connection profiles, including IPv4/IPv6 settings and active status."""
+    """Gets all configured connection profiles, including UUID, IPv4/IPv6 settings and active status."""
     try:
         bus = dbus.SystemBus()
         nm_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
@@ -204,7 +238,7 @@ async def get_connections() -> str:
 async def set_connection_state(connection_uuid: str, active: bool, ctx: Context) -> str:
     """
     Activates (up) or deactivates (down) a connection profile by UUID.
-    Includes safety checkpoint and connectivity check with interactive confirmation.
+    Includes safety checkpoint and connectivity check with interactive confirmation if supported.
     """
     bus = dbus.SystemBus()
     tx = NMTransaction(bus, ctx)
@@ -212,13 +246,13 @@ async def set_connection_state(connection_uuid: str, active: bool, ctx: Context)
         nm_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
         manager = dbus.Interface(nm_proxy, "org.freedesktop.NetworkManager")
         settings_path = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/Settings"), "org.freedesktop.NetworkManager.Settings").GetConnectionByUuid(connection_uuid)
-        if active: await ctx.info(f"Activating {connection_uuid}..."); manager.ActivateConnection(settings_path, "/", "/")
+        if active: manager.ActivateConnection(settings_path, "/", "/")
         else:
-            await ctx.info(f"Deactivating {connection_uuid}...")
             active_paths = dbus.Interface(nm_proxy, "org.freedesktop.DBus.Properties").Get("org.freedesktop.NetworkManager", "ActiveConnections")
             for ac_path in active_paths:
                 if str(dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", ac_path), "org.freedesktop.DBus.Properties").Get("org.freedesktop.NetworkManager.Connection.Active", "Uuid")) == connection_uuid:
                     manager.DeactivateConnection(ac_path); break
+
     return json.dumps(await tx.run(action), indent=2)
 
 if __name__ == "__main__":
