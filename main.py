@@ -1,9 +1,8 @@
 import dbus
-import json
 import asyncio
 import os
-import sys
 import logging
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import PingRequest, EmptyResult, ClientCapabilities, ElicitationCapability
@@ -14,12 +13,6 @@ logging.basicConfig(
     format='%(levelname)s: %(name)s - %(message)s'
 )
 logger = logging.getLogger("nm-mcp-server")
-
-mcp = FastMCP(
-    "NetworkManager MCP Server",
-    host=os.getenv("MCP_HOST", "0.0.0.0"),
-    port=int(os.getenv("MCP_PORT", "8000"))
-)
 
 DEVICE_TYPES = {
     0: "Unknown", 1: "Ethernet", 2: "Wi-Fi", 5: "Bluetooth", 6: "OLPC",
@@ -37,6 +30,37 @@ DEVICE_STATES = {
 CONNECTIVITY_STATES = {
     0: "Unknown", 1: "None", 2: "Portal", 3: "Limited", 4: "Full",
 }
+
+class DeviceInfo(BaseModel):
+    interface: str
+    type: str
+    state: str
+    mac_address: Optional[str] = None
+
+class IPConfig(BaseModel):
+    method: Optional[str] = None
+    addresses: List[str] = []
+
+class ConnectionInfo(BaseModel):
+    name: str
+    uuid: str
+    type: str
+    interface_name: Optional[str] = None
+    active: bool
+    ipv4: IPConfig
+    ipv6: IPConfig
+
+class DnsEntry(BaseModel):
+    servers: List[str]
+    priority: int
+    interface: str
+
+class ConnectionConfirm(BaseModel):
+    confirm: bool = Field(alias="Confirm?", title="Confirm?")
+
+class TransactionResult(BaseModel):
+    status: str
+    message: str
 
 def dbus_to_python(data):
     """Recursively convert D-Bus types to standard Python types."""
@@ -58,202 +82,270 @@ def dbus_to_python(data):
         return {dbus_to_python(key): dbus_to_python(value) for key, value in data.items()}
     return data
 
-def get_ip_config_details(bus, path, interface_name):
-    if not path or path == "/": return {"addresses": [], "routes": []}
-    try:
-        proxy = bus.get_object("org.freedesktop.NetworkManager", path)
-        prop_iface = dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
-        props = prop_iface.GetAll(interface_name)
-        p = dbus_to_python(props)
-        return {"addresses": p.get("AddressData", []), "routes": p.get("RouteData", [])}
-    except Exception: return {"addresses": [], "routes": []}
+class NMClient:
+    """Centralized NetworkManager D-Bus client."""
+    def __init__(self):
+        self._bus = None
+        self._manager = None
+        self._props = None
 
-class ConnectionConfirm(BaseModel):
-    confirm: bool = Field(alias="Confirm?", title="Confirm?")
+    @property
+    def bus(self):
+        if not self._bus:
+            self._bus = dbus.SystemBus()
+        return self._bus
+
+    @property
+    def manager(self):
+        if not self._manager:
+            proxy = self.bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
+            self._manager = dbus.Interface(proxy, "org.freedesktop.NetworkManager")
+        return self._manager
+
+    @property
+    def props(self):
+        if not self._props:
+            proxy = self.bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
+            self._props = dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+        return self._props
+
+    def get_connectivity(self) -> int:
+        return int(self.props.Get("org.freedesktop.NetworkManager", "Connectivity"))
+
+    def parse_ip_config(self, data: Dict[str, Any]) -> IPConfig:
+        """Parses D-Bus IP config data into a validated IPConfig model."""
+        # Handles both 'AddressData' (runtime) and 'address-data' (settings)
+        raw_addresses = data.get("AddressData", data.get("address-data", []))
+        formatted_addresses = [
+            f"{a['address']}/{a['prefix']}" for a in raw_addresses
+        ]
+        return IPConfig(
+            method=data.get("method"),
+            addresses=formatted_addresses
+        )
+
+    def get_ip_config(self, path: str, interface_name: str) -> IPConfig:
+        if not path or path == "/": return IPConfig()
+        try:
+            proxy = self.bus.get_object("org.freedesktop.NetworkManager", path)
+            prop_iface = dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+            p = dbus_to_python(prop_iface.GetAll(interface_name))
+            return self.parse_ip_config(p)
+        except Exception as e:
+            logger.error(f"Failed to get IP config for {path}: {e}")
+            return IPConfig()
 
 class NMTransaction:
-    """Helper to handle Checkpoint -> Modify -> Check -> Rollback/Commit flow."""
-    def __init__(self, bus, ctx: Context, timeout=60):
-        self.bus = bus
+    """Helper for safe NetworkManager changes with rollback support."""
+    def __init__(self, client: NMClient, ctx: Context, timeout=60):
+        self.client = client
         self.ctx = ctx
         self.timeout = timeout
         self.checkpoint = None
-        self.nm_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
-        self.manager = dbus.Interface(self.nm_proxy, "org.freedesktop.NetworkManager")
-        self.props = dbus.Interface(self.nm_proxy, "org.freedesktop.DBus.Properties")
 
-    def get_connectivity(self):
-        return int(self.props.Get("org.freedesktop.NetworkManager", "Connectivity"))
-
-    async def run(self, action_fn):
-        initial_conn = self.get_connectivity()
-        devices = self.manager.GetDevices()
-        self.checkpoint = self.manager.CheckpointCreate(devices, self.timeout, 1) # 1 = Destroy all other checkpoints
-
+    async def run(self, action_fn) -> TransactionResult:
         try:
-            await action_fn()
+            self.checkpoint = None
+            initial_conn = self.client.get_connectivity()
+            devices = self.client.manager.GetDevices()
+            self.checkpoint = self.client.manager.CheckpointCreate(devices, self.timeout, 1)
 
-            # Wait a bit for changes to propagate/re-activation
+            await action_fn()
             await asyncio.sleep(2)
 
-            # Check that session is still alive otherwise issue a rollback
+            # Check session health
             try:
                 await asyncio.wait_for(self.ctx.session.send_request(PingRequest(), result_type=EmptyResult), timeout=5)
-            except (asyncio.TimeoutError, Exception) as e:
-                if self.checkpoint:
-                    try:
-                        self.manager.CheckpointRollback(self.checkpoint)
-                    except Exception as rb_err:
-                        logger.error(f"Failed to rollback: {rb_err}")
-                return {"status": "error", "message": "MCP Session unresponsive after change. Changes rolled back."}
+            except asyncio.TimeoutError:
+                self.client.manager.CheckpointRollback(self.checkpoint)
+                return TransactionResult(status="error", message="MCP Session unresponsive after change. Changes rolled back.")
 
-            new_conn = self.get_connectivity()
-            await self.ctx.info(f"New connectivity: {CONNECTIVITY_STATES.get(new_conn)}")
+            # Check connectivity
+            new_conn = self.client.get_connectivity()
 
             if new_conn < initial_conn:
-                # Check if client supports elicitation
-                can_elicit = False
-                try:
-                    can_elicit = self.ctx.session.check_client_capability(
-                        ClientCapabilities(elicitation=ElicitationCapability())
-                    )
-                except Exception:
-                    can_elicit = False
+                can_elicit = self.ctx.session.check_client_capability(ClientCapabilities(elicitation=ElicitationCapability()))
 
                 if can_elicit:
-                    prompt = (f"Warning: Connectivity deteriorated from {CONNECTIVITY_STATES.get(initial_conn)} "
-                              f"to {CONNECTIVITY_STATES.get(new_conn)}. Do you want to keep these changes?")
-                    try:
-                        response = await self.ctx.elicit(message=prompt, schema=ConnectionConfirm)
-                        # Extract confirm from the model instance (which might be in 'data')
-                        data = getattr(response, "data", response)
-                        confirm = getattr(data, "confirm", False)
-                    except Exception as e:
-                        logger.error(f"Failed elicitation request: {e}")
-                        confirm = False
+                    prompt = f"Warning: Connectivity dropped to {CONNECTIVITY_STATES.get(new_conn)}. Keep changes?"
+                    response = await self.ctx.elicit(message=prompt, schema=ConnectionConfirm)
+                    data = getattr(response, "data", response)
+                    confirm = getattr(data, "confirm", False)
 
                     if confirm:
-                        self.manager.CheckpointDestroy(self.checkpoint)
-                        return {"status": "success", "message": "Changes committed by user."}
+                        self.client.manager.CheckpointDestroy(self.checkpoint)
+                        return TransactionResult(status="success", message="Changes committed by user.")
                     else:
-                        self.manager.CheckpointRollback(self.checkpoint)
-                        return {"status": "rollback", "message": "Changes rolled back due to user declining."}
+                        self.client.manager.CheckpointRollback(self.checkpoint)
+                        return TransactionResult(status="rollback", message="Changes rolled back by user.")
                 else:
-                    self.manager.CheckpointDestroy(self.checkpoint)
-                    return {"status": "success", "message": f"Changes applied. Warning: Connectivity deteriorated to {CONNECTIVITY_STATES.get(new_conn)}."}
+                    self.client.manager.CheckpointDestroy(self.checkpoint)
+                    return TransactionResult(status="success", message=f"Applied. Warning: Connectivity is {CONNECTIVITY_STATES.get(new_conn)}.")
             else:
-                self.manager.CheckpointDestroy(self.checkpoint)
-                return {"status": "success", "message": "Changes applied and committed."}
+                self.client.manager.CheckpointDestroy(self.checkpoint)
+                return TransactionResult(status="success", message="Changes applied and committed.")
 
         except Exception as e:
-            logger.exception(f"Error during NMTransaction: {e}")
+            logger.exception(f"Error during transaction: {e}")
             if self.checkpoint:
-                try: self.manager.CheckpointRollback(self.checkpoint)
-                except Exception: pass
+                try:
+                    self.client.manager.CheckpointRollback(self.checkpoint)
+                except Exception as rb_err:
+                    logger.error(f"Failed to rollback after transaction error: {rb_err}")
             raise e
+
+mcp = FastMCP(
+    "NetworkManager MCP Server",
+    host=os.getenv("MCP_HOST", "0.0.0.0"),
+    port=int(os.getenv("MCP_PORT", "8000"))
+)
+nm = NMClient()
 
 @mcp.tool()
 async def get_connectivity() -> str:
-    """Gets the global network connectivity state (e.g., Full, Limited, None)."""
-    try:
-        bus = dbus.SystemBus()
-        nm_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
-        nm_prop_iface = dbus.Interface(nm_proxy, "org.freedesktop.DBus.Properties")
-        val = nm_prop_iface.Get("org.freedesktop.NetworkManager", "Connectivity")
-        return CONNECTIVITY_STATES.get(val, "Unknown")
-    except Exception as e: return f"Error: {str(e)}"
+    """
+    Gets the global network connectivity state.
+    """
+    return CONNECTIVITY_STATES.get(nm.get_connectivity(), "Unknown")
 
 @mcp.tool()
-async def get_dns() -> str:
-    """Gets the system DNS configuration (nameservers, priority, interface)."""
+async def get_dns() -> List[DnsEntry]:
+    """
+    Gets the system DNS configuration.
+
+    Returns:
+        - servers
+        - priority
+        - interface
+    """
+    dns_entries = []
     try:
-        bus = dbus.SystemBus()
-        dns_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/DnsManager")
-        raw = dbus_to_python(dbus.Interface(dns_proxy, "org.freedesktop.DBus.Properties").Get("org.freedesktop.NetworkManager.DnsManager", "Configuration"))
-        dns_config = [{"servers": e.get("nameservers", []), "priority": e.get("priority"), "interface": e.get("interface")} for e in raw]
-        return json.dumps(dns_config, indent=2)
-    except Exception as e: return f"Error: {str(e)}"
+        dns_proxy = nm.bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/DnsManager")
+        dns_data = dbus_to_python(dbus.Interface(dns_proxy, "org.freedesktop.DBus.Properties").Get("org.freedesktop.NetworkManager.DnsManager", "Configuration"))
+        for dns in dns_data:
+            dns_entries.append(DnsEntry(servers=dns.get("nameservers", []), priority=dns.get("priority"), interface=dns.get("interface")))
+
+    except Exception as e:
+        logger.error(f"Failed to get dns: {e}")
+
+    return dns_entries
 
 @mcp.tool()
-async def get_devices() -> str:
-    """Gets a list of all network devices and their current status (interface, type, state, mac)."""
+async def get_devices() -> List[DeviceInfo]:
+    """
+    Gets a list of all network devices.
+
+    Returns:
+        - interface
+        - type
+        - state
+        - mac_address
+    """
+    devices = []
     try:
-        bus = dbus.SystemBus()
-        nm_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
-        nm_manager = dbus.Interface(nm_proxy, "org.freedesktop.NetworkManager")
-        devices = []
-        for d_path in nm_manager.GetDevices():
-            try:
-                dev_proxy = bus.get_object("org.freedesktop.NetworkManager", d_path)
-                p = dbus_to_python(dbus.Interface(dev_proxy, "org.freedesktop.DBus.Properties").GetAll("org.freedesktop.NetworkManager.Device"))
-                if "DeviceType" in p: p["DeviceTypeString"] = DEVICE_TYPES.get(p["DeviceType"], "Unknown")
-                if "State" in p: p["StateString"] = DEVICE_STATES.get(p["State"], "Unknown")
-                devices.append({"interface": p.get("Interface"), "type": p.get("DeviceTypeString"), "state": p.get("StateString"), "mac_address": p.get("HwAddress")})
-            except Exception: continue
-        return json.dumps(devices, indent=2)
-    except Exception as e: return f"Error: {str(e)}"
+        for d_path in nm.manager.GetDevices():
+            dev_proxy = nm.bus.get_object("org.freedesktop.NetworkManager", d_path)
+            p = dbus_to_python(dbus.Interface(dev_proxy, "org.freedesktop.DBus.Properties").GetAll("org.freedesktop.NetworkManager.Device"))
+            devices.append(DeviceInfo(
+                interface=p.get("Interface"),
+                type=DEVICE_TYPES.get(p.get("DeviceType"), "Unknown"),
+                state=DEVICE_STATES.get(p.get("State"), "Unknown"),
+                mac_address=p.get("HwAddress")
+            ))
+
+    except Exception as e:
+        logger.error(f"Failed to get devices: {e}")
+
+    return devices
 
 @mcp.tool()
-async def get_connections() -> str:
-    """Gets all configured connection profiles, including UUID, IPv4/IPv6 settings and active status."""
+async def get_connections() -> List[ConnectionInfo]:
+    """
+    Gets all configured connection profiles.
+
+    Returns:
+        - name
+        - uuid
+        - type
+        - interface_name
+        - active
+        - ipv4
+        - ipv6
+
+        IPConfig objects contain:
+        - method
+        - addresses
+    """
+    active_info = {}
     try:
-        bus = dbus.SystemBus()
-        nm_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
-        nm_prop_iface = dbus.Interface(nm_proxy, "org.freedesktop.DBus.Properties")
-        active_info = {}
-        try:
-            for ac_path in nm_prop_iface.Get("org.freedesktop.NetworkManager", "ActiveConnections"):
-                try:
-                    ac_proxy = bus.get_object("org.freedesktop.NetworkManager", ac_path)
-                    ac_p = dbus_to_python(dbus.Interface(ac_proxy, "org.freedesktop.DBus.Properties").GetAll("org.freedesktop.NetworkManager.Connection.Active"))
-                    active_info[str(ac_p.get("Uuid"))] = {"ip4_config": str(ac_p.get("Ip4Config")), "ip6_config": str(ac_p.get("Ip6Config"))}
-                except Exception: continue
-        except Exception: pass
-        settings_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/Settings")
+        for ac_path in nm.props.Get("org.freedesktop.NetworkManager", "ActiveConnections"):
+            ac_proxy = nm.bus.get_object("org.freedesktop.NetworkManager", ac_path)
+            ac_p = dbus_to_python(dbus.Interface(ac_proxy, "org.freedesktop.DBus.Properties").GetAll("org.freedesktop.NetworkManager.Connection.Active"))
+            active_info[str(ac_p.get("Uuid"))] = {"ip4": str(ac_p.get("Ip4Config")), "ip6": str(ac_p.get("Ip6Config"))}
+
+        settings_proxy = nm.bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/Settings")
         settings_iface = dbus.Interface(settings_proxy, "org.freedesktop.NetworkManager.Settings")
+
         connections = []
         for c_path in settings_iface.ListConnections():
-            try:
-                con_proxy = bus.get_object("org.freedesktop.NetworkManager", c_path)
-                config = dbus_to_python(dbus.Interface(con_proxy, "org.freedesktop.NetworkManager.Settings.Connection").GetSettings())
-                s_con = config.get("connection", {}); uuid = s_con.get("uuid")
-                ipv4_s = config.get("ipv4", {}); ipv6_s = config.get("ipv6", {})
-                is_active = uuid in active_info
-                ipv4_data = {"method": ipv4_s.get("method"), "addresses": ipv4_s.get("address-data", []), "routes": ipv4_s.get("route-data", [])}
-                ipv6_data = {"method": ipv6_s.get("method"), "addresses": ipv6_s.get("address-data", []), "routes": ipv6_s.get("route-data", [])}
-                if is_active:
-                    info = active_info[uuid]
-                    a4 = get_ip_config_details(bus, info["ip4_config"], "org.freedesktop.NetworkManager.IP4Config")
-                    if a4["addresses"]: ipv4_data["addresses"] = a4["addresses"]
-                    if a4["routes"]: ipv4_data["routes"] = a4["routes"]
-                    a6 = get_ip_config_details(bus, info["ip6_config"], "org.freedesktop.NetworkManager.IP6Config")
-                    if a6["addresses"]: ipv6_data["addresses"] = a6["addresses"]
-                    if a6["routes"]: ipv6_data["routes"] = a6["routes"]
-                connections.append({"name": s_con.get("id"), "uuid": uuid, "type": s_con.get("type"), "interface-name": s_con.get("interface-name"), "active": is_active, "ipv4": ipv4_data, "ipv6": ipv6_data})
-            except Exception: continue
-        return json.dumps(connections, indent=2)
-    except Exception as e: return f"Error: {str(e)}"
+            con_proxy = nm.bus.get_object("org.freedesktop.NetworkManager", c_path)
+            config = dbus_to_python(dbus.Interface(con_proxy, "org.freedesktop.NetworkManager.Settings.Connection").GetSettings())
+            s_con = config.get("connection", {})
+            uuid = s_con.get("uuid")
+            ipv4_s = config.get("ipv4", {})
+            ipv6_s = config.get("ipv6", {})
+
+            ipv4_data = nm.parse_ip_config(config.get("ipv4", {}))
+            ipv6_data = nm.parse_ip_config(config.get("ipv6", {}))
+
+            if uuid in active_info:
+                info = active_info[uuid]
+                # Overlay active configuration (e.g. DHCP addresses) over stored settings
+                a4 = nm.get_ip_config(info["ip4"], "org.freedesktop.NetworkManager.IP4Config")
+                if a4.addresses: ipv4_data.addresses = a4.addresses
+                a6 = nm.get_ip_config(info["ip6"], "org.freedesktop.NetworkManager.IP6Config")
+                if a6.addresses: ipv6_data.addresses = a6.addresses
+
+            connections.append(ConnectionInfo(
+                name=s_con.get("id"), uuid=uuid, type=s_con.get("type"),
+                interface_name=s_con.get("interface-name"), active=(uuid in active_info),
+                ipv4=ipv4_data, ipv6=ipv6_data
+            ))
+
+    except Exception as e:
+        logger.error(f"Failed to get connections: {e}")
+
+    return connections
 
 @mcp.tool()
-async def set_connection_state(connection_uuid: str, active: bool, ctx: Context) -> str:
+async def set_connection_state(connection_uuid: str, active: bool, ctx: Context) -> TransactionResult:
     """
-    Activates (up) or deactivates (down) a connection profile by UUID.
-    Includes safety checkpoint and connectivity check with interactive confirmation if supported.
-    """
-    bus = dbus.SystemBus()
-    tx = NMTransaction(bus, ctx)
-    async def action():
-        nm_proxy = bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
-        manager = dbus.Interface(nm_proxy, "org.freedesktop.NetworkManager")
-        settings_path = dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/Settings"), "org.freedesktop.NetworkManager.Settings").GetConnectionByUuid(connection_uuid)
-        if active: manager.ActivateConnection(settings_path, "/", "/")
-        else:
-            active_paths = dbus.Interface(nm_proxy, "org.freedesktop.DBus.Properties").Get("org.freedesktop.NetworkManager", "ActiveConnections")
-            for ac_path in active_paths:
-                if str(dbus.Interface(bus.get_object("org.freedesktop.NetworkManager", ac_path), "org.freedesktop.DBus.Properties").Get("org.freedesktop.NetworkManager.Connection.Active", "Uuid")) == connection_uuid:
-                    manager.DeactivateConnection(ac_path); break
+    Activates or deactivates a connection profile by UUID.
+    Includes safety checkpoint and connectivity check with interactive confirmation with the user.
 
-    return json.dumps(await tx.run(action), indent=2)
+    Args:
+        connection_uuid: The UUID of the connection to activate or deactivate.
+        active: Set to True to activate (bring up) or False to deactivate (bring down).
+
+    Returns:
+        - status
+        - message
+    """
+    tx = NMTransaction(nm, ctx)
+
+    async def action():
+        settings_path = dbus.Interface(nm.bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/Settings"), "org.freedesktop.NetworkManager.Settings").GetConnectionByUuid(connection_uuid)
+        if active:
+            nm.manager.ActivateConnection(settings_path, "/", "/")
+        else:
+            active_paths = nm.props.Get("org.freedesktop.NetworkManager", "ActiveConnections")
+            for ac_path in active_paths:
+                ac_proxy = nm.bus.get_object("org.freedesktop.NetworkManager", ac_path)
+                if str(dbus.Interface(ac_proxy, "org.freedesktop.DBus.Properties").Get("org.freedesktop.NetworkManager.Connection.Active", "Uuid")) == connection_uuid:
+                    nm.manager.DeactivateConnection(ac_path)
+                    break
+
+    return await tx.run(action)
 
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "stdio")
