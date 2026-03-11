@@ -262,7 +262,7 @@ wheels = [
 ]
 
 [[package]]
-name = "nm-mcp-server"
+name = "mcp-server-nm"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -11,7 +11,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(levelname)s: %(name)s - %(message)s'
 )
-logger = logging.getLogger("nm-mcp-server")
+logger = logging.getLogger("mcp-server-nm")
 
 DEVICE_TYPES = {
     0: "Unknown", 1: "Ethernet", 2: "Wi-Fi", 5: "Bluetooth", 6: "OLPC",
