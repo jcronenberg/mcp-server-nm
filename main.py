@@ -2,7 +2,6 @@
 
 import dbus
 import asyncio
-import os
 import logging
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
@@ -186,11 +185,7 @@ class NMTransaction:
                     logger.error(f"Failed to rollback after transaction error: {rb_err}")
             raise
 
-mcp = FastMCP(
-    "NetworkManager MCP Server",
-    host=os.getenv("MCP_HOST", "0.0.0.0"),
-    port=int(os.getenv("MCP_PORT", "8000"))
-)
+mcp = FastMCP("NetworkManager MCP Server")
 nm = NMClient()
 
 @mcp.tool()
@@ -331,8 +326,4 @@ async def set_connection_state(connection_uuid: str, active: bool, ctx: Context)
     return await tx.run(action)
 
 if __name__ == "__main__":
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
-    if transport in ("http", "streamable-http"):
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run(transport="stdio")
+    mcp.run(transport="stdio")
