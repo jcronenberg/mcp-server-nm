@@ -132,7 +132,7 @@ class NMTransaction:
         try:
             initial_conn = self.client.get_connectivity()
             devices = self.client.manager.GetDevices()
-            self.checkpoint = self.client.manager.CheckpointCreate(devices, self.timeout, 1)
+            self.checkpoint = self.client.manager.CheckpointCreate(devices, self.timeout, 0)
 
             await action_fn()
             await asyncio.sleep(2)
