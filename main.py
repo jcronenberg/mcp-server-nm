@@ -44,6 +44,8 @@ class DeviceInfo(BaseModel):
 class IPConfig(BaseModel):
     method: str | None = None
     addresses: list[str] = []
+    gateway: str | None = None
+    dns: list[str] = []
 
 class ConnectionInfo(BaseModel):
     name: str
@@ -53,11 +55,6 @@ class ConnectionInfo(BaseModel):
     active: bool
     ipv4: IPConfig
     ipv6: IPConfig
-
-class DnsEntry(BaseModel):
-    servers: list[str]
-    priority: int
-    interface: str
 
 class ConnectionConfirm(BaseModel):
     confirm: bool = Field(alias="Confirm?", title="Confirm?")
@@ -105,9 +102,12 @@ class NMClient:
         """Parses D-Bus IP config data into a validated IPConfig model."""
         # Handles both 'AddressData' (runtime) and 'address-data' (settings)
         raw = data.get("AddressData", data.get("address-data", []))
+        dns_raw = data.get("NameserverData") or data.get("dns-data") or data.get("dns") or []
         return IPConfig(
             method=data.get("method"),
             addresses=[f"{a['address']}/{a['prefix']}" for a in raw],
+            gateway=data.get("Gateway") or data.get("gateway"),
+            dns=[d["address"] if isinstance(d, dict) else d for d in dns_raw],
         )
 
     def get_ip_config(self, path: str, iface_name: str) -> IPConfig:
@@ -185,22 +185,6 @@ async def get_connectivity() -> str:
     return CONNECTIVITY_STATES.get(nm.get_connectivity(), "Unknown")
 
 @mcp.tool()
-async def get_dns() -> list[DnsEntry]:
-    """
-    Gets the system DNS configuration.
-
-    Returns:
-        - servers
-        - priority
-        - interface
-    """
-    dns_data = nm.get_prop(f"{NM_PATH}/DnsManager", f"{NM}.DnsManager", "Configuration")
-    return [
-        DnsEntry(servers=dns.get("nameservers", []), priority=dns.get("priority"), interface=dns.get("interface"))
-        for dns in dns_data
-    ]
-
-@mcp.tool()
 async def get_devices() -> list[DeviceInfo]:
     """
     Gets a list of all network devices.
@@ -239,6 +223,8 @@ async def get_connections() -> list[ConnectionInfo]:
         IPConfig objects contain:
         - method
         - addresses
+        - gateway
+        - dns
     """
     active_info = {}
     for ac_path in nm.get_prop(NM_PATH, NM, "ActiveConnections"):
@@ -257,8 +243,14 @@ async def get_connections() -> list[ConnectionInfo]:
         if uuid in active_info:
             info = active_info[uuid]
             # Overlay active configuration (e.g. DHCP addresses) over stored settings
-            ipv4_data.addresses = nm.get_ip_config(info["ip4"], f"{NM}.IP4Config").addresses or ipv4_data.addresses
-            ipv6_data.addresses = nm.get_ip_config(info["ip6"], f"{NM}.IP6Config").addresses or ipv6_data.addresses
+            for cfg, ip_path, iface in [
+                (ipv4_data, info["ip4"], f"{NM}.IP4Config"),
+                (ipv6_data, info["ip6"], f"{NM}.IP6Config"),
+            ]:
+                runtime = nm.get_ip_config(ip_path, iface)
+                cfg.addresses = runtime.addresses or cfg.addresses
+                cfg.gateway = runtime.gateway or cfg.gateway
+                cfg.dns = runtime.dns or cfg.dns
 
         connections.append(ConnectionInfo(
             name=s_con.get("id"), uuid=uuid, type=s_con.get("type"),
