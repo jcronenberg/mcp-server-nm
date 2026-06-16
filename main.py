@@ -194,16 +194,11 @@ async def get_dns() -> list[DnsEntry]:
         - priority
         - interface
     """
-    dns_entries = []
-    try:
-        dns_data = nm.get_prop(f"{NM_PATH}/DnsManager", f"{NM}.DnsManager", "Configuration")
-        for dns in dns_data:
-            dns_entries.append(DnsEntry(servers=dns.get("nameservers", []), priority=dns.get("priority"), interface=dns.get("interface")))
-
-    except Exception as e:
-        logger.error(f"Failed to get dns: {e}")
-
-    return dns_entries
+    dns_data = nm.get_prop(f"{NM_PATH}/DnsManager", f"{NM}.DnsManager", "Configuration")
+    return [
+        DnsEntry(servers=dns.get("nameservers", []), priority=dns.get("priority"), interface=dns.get("interface"))
+        for dns in dns_data
+    ]
 
 @mcp.tool()
 async def get_devices() -> list[DeviceInfo]:
@@ -217,19 +212,14 @@ async def get_devices() -> list[DeviceInfo]:
         - mac_address
     """
     devices = []
-    try:
-        for d_path in nm.manager.GetDevices():
-            p = nm.get_all(d_path, f"{NM}.Device")
-            devices.append(DeviceInfo(
-                interface=p.get("Interface"),
-                type=DEVICE_TYPES.get(p.get("DeviceType"), "Unknown"),
-                state=DEVICE_STATES.get(p.get("State"), "Unknown"),
-                mac_address=p.get("HwAddress")
-            ))
-
-    except Exception as e:
-        logger.error(f"Failed to get devices: {e}")
-
+    for d_path in nm.manager.GetDevices():
+        p = nm.get_all(d_path, f"{NM}.Device")
+        devices.append(DeviceInfo(
+            interface=p.get("Interface"),
+            type=DEVICE_TYPES.get(p.get("DeviceType"), "Unknown"),
+            state=DEVICE_STATES.get(p.get("State"), "Unknown"),
+            mac_address=p.get("HwAddress")
+        ))
     return devices
 
 @mcp.tool()
@@ -251,34 +241,30 @@ async def get_connections() -> list[ConnectionInfo]:
         - addresses
     """
     active_info = {}
-    try:
-        for ac_path in nm.get_prop(NM_PATH, NM, "ActiveConnections"):
-            ac_p = nm.get_all(ac_path, f"{NM}.Connection.Active")
-            active_info[ac_p.get("Uuid")] = {"ip4": ac_p.get("Ip4Config"), "ip6": ac_p.get("Ip6Config")}
+    for ac_path in nm.get_prop(NM_PATH, NM, "ActiveConnections"):
+        ac_p = nm.get_all(ac_path, f"{NM}.Connection.Active")
+        active_info[ac_p.get("Uuid")] = {"ip4": ac_p.get("Ip4Config"), "ip6": ac_p.get("Ip6Config")}
 
-        connections = []
-        for c_path in nm.settings.ListConnections():
-            config = dbus_to_python(nm.iface(c_path, f"{NM}.Settings.Connection").GetSettings())
-            s_con = config.get("connection", {})
-            uuid = s_con.get("uuid")
+    connections = []
+    for c_path in nm.settings.ListConnections():
+        config = dbus_to_python(nm.iface(c_path, f"{NM}.Settings.Connection").GetSettings())
+        s_con = config.get("connection", {})
+        uuid = s_con.get("uuid")
 
-            ipv4_data = nm.parse_ip_config(config.get("ipv4", {}))
-            ipv6_data = nm.parse_ip_config(config.get("ipv6", {}))
+        ipv4_data = nm.parse_ip_config(config.get("ipv4", {}))
+        ipv6_data = nm.parse_ip_config(config.get("ipv6", {}))
 
-            if uuid in active_info:
-                info = active_info[uuid]
-                # Overlay active configuration (e.g. DHCP addresses) over stored settings
-                ipv4_data.addresses = nm.get_ip_config(info["ip4"], f"{NM}.IP4Config").addresses or ipv4_data.addresses
-                ipv6_data.addresses = nm.get_ip_config(info["ip6"], f"{NM}.IP6Config").addresses or ipv6_data.addresses
+        if uuid in active_info:
+            info = active_info[uuid]
+            # Overlay active configuration (e.g. DHCP addresses) over stored settings
+            ipv4_data.addresses = nm.get_ip_config(info["ip4"], f"{NM}.IP4Config").addresses or ipv4_data.addresses
+            ipv6_data.addresses = nm.get_ip_config(info["ip6"], f"{NM}.IP6Config").addresses or ipv6_data.addresses
 
-            connections.append(ConnectionInfo(
-                name=s_con.get("id"), uuid=uuid, type=s_con.get("type"),
-                interface_name=s_con.get("interface-name"), active=(uuid in active_info),
-                ipv4=ipv4_data, ipv6=ipv6_data
-            ))
-
-    except Exception as e:
-        logger.error(f"Failed to get connections: {e}")
+        connections.append(ConnectionInfo(
+            name=s_con.get("id"), uuid=uuid, type=s_con.get("type"),
+            interface_name=s_con.get("interface-name"), active=(uuid in active_info),
+            ipv4=ipv4_data, ipv6=ipv6_data
+        ))
 
     return connections
 
