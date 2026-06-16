@@ -3,7 +3,7 @@
 import dbus
 import asyncio
 import logging
-from typing import List, Optional, Dict, Any
+from typing import Any
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import PingRequest, EmptyResult, ClientCapabilities, ElicitationCapability
@@ -39,23 +39,23 @@ class DeviceInfo(BaseModel):
     interface: str
     type: str
     state: str
-    mac_address: Optional[str] = None
+    mac_address: str | None = None
 
 class IPConfig(BaseModel):
-    method: Optional[str] = None
-    addresses: List[str] = []
+    method: str | None = None
+    addresses: list[str] = []
 
 class ConnectionInfo(BaseModel):
     name: str
     uuid: str
     type: str
-    interface_name: Optional[str] = None
+    interface_name: str | None = None
     active: bool
     ipv4: IPConfig
     ipv6: IPConfig
 
 class DnsEntry(BaseModel):
-    servers: List[str]
+    servers: list[str]
     priority: int
     interface: str
 
@@ -85,20 +85,9 @@ def dbus_to_python(data):
 class NMClient:
     """Centralized NetworkManager D-Bus client."""
     def __init__(self):
-        self._bus = None
-        self._manager = None
-
-    @property
-    def bus(self):
-        if not self._bus:
-            self._bus = dbus.SystemBus()
-        return self._bus
-
-    @property
-    def manager(self):
-        if not self._manager:
-            self._manager = self.iface(NM_PATH, NM)
-        return self._manager
+        self.bus = dbus.SystemBus()
+        self.manager = self.iface(NM_PATH, NM)
+        self.settings = self.iface(f"{NM_PATH}/Settings", f"{NM}.Settings")
 
     def iface(self, path: str, name: str) -> dbus.Interface:
         return dbus.Interface(self.bus.get_object(NM, path), name)
@@ -106,13 +95,13 @@ class NMClient:
     def get_prop(self, path: str, iface_name: str, prop: str) -> Any:
         return dbus_to_python(self.iface(path, PROPS).Get(iface_name, prop))
 
-    def get_all(self, path: str, iface_name: str) -> Dict[str, Any]:
+    def get_all(self, path: str, iface_name: str) -> dict[str, Any]:
         return dbus_to_python(self.iface(path, PROPS).GetAll(iface_name))
 
     def get_connectivity(self) -> int:
         return self.get_prop(NM_PATH, NM, "Connectivity")
 
-    def parse_ip_config(self, data: Dict[str, Any]) -> IPConfig:
+    def parse_ip_config(self, data: dict[str, Any]) -> IPConfig:
         """Parses D-Bus IP config data into a validated IPConfig model."""
         # Handles both 'AddressData' (runtime) and 'address-data' (settings)
         raw = data.get("AddressData", data.get("address-data", []))
@@ -122,7 +111,7 @@ class NMClient:
         )
 
     def get_ip_config(self, path: str, iface_name: str) -> IPConfig:
-        if not path or path == "/":
+        if path == "/":
             return IPConfig()
         try:
             return self.parse_ip_config(self.get_all(path, iface_name))
@@ -196,7 +185,7 @@ async def get_connectivity() -> str:
     return CONNECTIVITY_STATES.get(nm.get_connectivity(), "Unknown")
 
 @mcp.tool()
-async def get_dns() -> List[DnsEntry]:
+async def get_dns() -> list[DnsEntry]:
     """
     Gets the system DNS configuration.
 
@@ -217,7 +206,7 @@ async def get_dns() -> List[DnsEntry]:
     return dns_entries
 
 @mcp.tool()
-async def get_devices() -> List[DeviceInfo]:
+async def get_devices() -> list[DeviceInfo]:
     """
     Gets a list of all network devices.
 
@@ -244,7 +233,7 @@ async def get_devices() -> List[DeviceInfo]:
     return devices
 
 @mcp.tool()
-async def get_connections() -> List[ConnectionInfo]:
+async def get_connections() -> list[ConnectionInfo]:
     """
     Gets all configured connection profiles.
 
@@ -267,10 +256,8 @@ async def get_connections() -> List[ConnectionInfo]:
             ac_p = nm.get_all(ac_path, f"{NM}.Connection.Active")
             active_info[ac_p.get("Uuid")] = {"ip4": ac_p.get("Ip4Config"), "ip6": ac_p.get("Ip6Config")}
 
-        settings_iface = nm.iface(f"{NM_PATH}/Settings", f"{NM}.Settings")
-
         connections = []
-        for c_path in settings_iface.ListConnections():
+        for c_path in nm.settings.ListConnections():
             config = dbus_to_python(nm.iface(c_path, f"{NM}.Settings.Connection").GetSettings())
             s_con = config.get("connection", {})
             uuid = s_con.get("uuid")
@@ -281,10 +268,8 @@ async def get_connections() -> List[ConnectionInfo]:
             if uuid in active_info:
                 info = active_info[uuid]
                 # Overlay active configuration (e.g. DHCP addresses) over stored settings
-                a4 = nm.get_ip_config(info["ip4"], f"{NM}.IP4Config")
-                if a4.addresses: ipv4_data.addresses = a4.addresses
-                a6 = nm.get_ip_config(info["ip6"], f"{NM}.IP6Config")
-                if a6.addresses: ipv6_data.addresses = a6.addresses
+                ipv4_data.addresses = nm.get_ip_config(info["ip4"], f"{NM}.IP4Config").addresses or ipv4_data.addresses
+                ipv6_data.addresses = nm.get_ip_config(info["ip6"], f"{NM}.IP6Config").addresses or ipv6_data.addresses
 
             connections.append(ConnectionInfo(
                 name=s_con.get("id"), uuid=uuid, type=s_con.get("type"),
@@ -314,7 +299,7 @@ async def set_connection_state(connection_uuid: str, active: bool, ctx: Context)
     tx = NMTransaction(nm, ctx)
 
     async def action():
-        settings_path = nm.iface(f"{NM_PATH}/Settings", f"{NM}.Settings").GetConnectionByUuid(connection_uuid)
+        settings_path = nm.settings.GetConnectionByUuid(connection_uuid)
         if active:
             nm.manager.ActivateConnection(settings_path, "/", "/")
         else:
