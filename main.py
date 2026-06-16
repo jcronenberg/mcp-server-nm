@@ -296,5 +296,27 @@ async def set_connection_state(connection_uuid: str, active: bool, ctx: Context)
 
     return await tx.run(action)
 
+@mcp.tool()
+async def get_hostname() -> str:
+    """
+    Gets the persistent system hostname.
+    """
+    return nm.get_prop(f"{NM_PATH}/Settings", f"{NM}.Settings", "Hostname")
+
+@mcp.tool()
+async def set_hostname(hostname: str) -> TransactionResult:
+    """
+    Sets the persistent system hostname.
+
+    Args:
+        hostname: The new hostname. Pass an empty string to clear it.
+
+    Returns:
+        - status
+        - message
+    """
+    nm.settings.SaveHostname(hostname)
+    return TransactionResult(status="success", message=f"Hostname set to '{hostname}'.")
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
