@@ -110,6 +110,25 @@ class NMClient:
             dns=[d["address"] if isinstance(d, dict) else d for d in dns_raw],
         )
 
+    def build_ip_settings(self, cfg: IPConfig) -> dict:
+        """Build an NM ipv4/ipv6 settings dict from an IPConfig."""
+        out: dict = {}
+        if cfg.method:
+            out["method"] = cfg.method
+        if cfg.addresses:
+            out["address-data"] = dbus.Array([
+                dbus.Dictionary({
+                    "address": addr.split("/")[0],
+                    "prefix": dbus.UInt32(int(addr.split("/")[1])),
+                }, signature="sv")
+                for addr in cfg.addresses
+            ], signature="a{sv}")
+        if cfg.gateway:
+            out["gateway"] = cfg.gateway
+        if cfg.dns:
+            out["dns"] = dbus.Array(cfg.dns, signature="s")
+        return out
+
     def get_ip_config(self, path: str, iface_name: str) -> IPConfig:
         if path == "/":
             return IPConfig()
@@ -285,6 +304,119 @@ async def set_connection_state(connection_uuid: str, active: bool, ctx: Context)
                 if nm.get_prop(ac_path, f"{NM}.Connection.Active", "Uuid") == connection_uuid:
                     nm.manager.DeactivateConnection(ac_path)
                     break
+
+    return await tx.run(action)
+
+@mcp.tool()
+async def add_connection(
+    name: str,
+    type: str,
+    interface_name: str | None = None,
+    ipv4: IPConfig | None = None,
+    ipv6: IPConfig | None = None,
+) -> ConnectionInfo:
+    """
+    Creates a new connection profile.
+
+    Args:
+        name: Display name for the connection.
+        type: NM connection type string, e.g. "802-3-ethernet", "vlan", "bridge".
+        interface_name: Optional interface to bind the profile to.
+        ipv4: IPv4 configuration. Defaults to DHCP ('auto').
+        ipv6: IPv6 configuration. Defaults to autoconf ('auto').
+
+    Returns:
+        ConnectionInfo for the new profile.
+    """
+    s_con = {"id": name, "type": type}
+    if interface_name:
+        s_con["interface-name"] = interface_name
+
+    settings = dbus.Dictionary({
+        "connection": dbus.Dictionary(s_con, signature="sv"),
+        type: dbus.Dictionary({}, signature="sv"),
+        "ipv4": dbus.Dictionary(nm.build_ip_settings(ipv4 or IPConfig(method="auto")), signature="sv"),
+        "ipv6": dbus.Dictionary(nm.build_ip_settings(ipv6 or IPConfig(method="auto")), signature="sv"),
+    }, signature="sa{sv}")
+    path = nm.settings.AddConnection(settings)
+    config = dbus_to_python(nm.iface(path, f"{NM}.Settings.Connection").GetSettings())
+    s_con_r = config.get("connection", {})
+    return ConnectionInfo(
+        name=s_con_r.get("id"), uuid=s_con_r.get("uuid"), type=s_con_r.get("type"),
+        interface_name=s_con_r.get("interface-name"), active=False,
+        ipv4=nm.parse_ip_config(config.get("ipv4", {})),
+        ipv6=nm.parse_ip_config(config.get("ipv6", {})),
+    )
+
+@mcp.tool()
+async def modify_connection(
+    uuid: str,
+    ctx: Context,
+    name: str | None = None,
+    interface_name: str | None = None,
+    ipv4: IPConfig | None = None,
+    ipv6: IPConfig | None = None,
+) -> TransactionResult:
+    """
+    Updates an existing connection profile by UUID. Provided ipv4/ipv6 sections
+    REPLACE the existing ones entirely, so include all fields you want to keep.
+    Re-activates the connection if it is currently active. Wrapped in a safety
+    checkpoint with rollback on connectivity loss.
+
+    Args:
+        uuid: UUID of the connection to modify.
+        name: New display name (optional).
+        interface_name: New interface binding (optional).
+        ipv4: New IPv4 configuration (replaces existing section).
+        ipv6: New IPv6 configuration (replaces existing section).
+
+    Returns:
+        - status
+        - message
+    """
+    tx = NMTransaction(nm, ctx)
+
+    async def action():
+        path = nm.settings.GetConnectionByUuid(uuid)
+        conn = nm.iface(path, f"{NM}.Settings.Connection")
+        existing = conn.GetSettings()
+
+        if name is not None:
+            existing["connection"]["id"] = name
+        if interface_name is not None:
+            existing["connection"]["interface-name"] = interface_name
+        if ipv4 is not None:
+            existing["ipv4"] = dbus.Dictionary(nm.build_ip_settings(ipv4), signature="sv")
+        if ipv6 is not None:
+            existing["ipv6"] = dbus.Dictionary(nm.build_ip_settings(ipv6), signature="sv")
+
+        conn.Update(existing)
+
+        for ac_path in nm.get_prop(NM_PATH, NM, "ActiveConnections"):
+            if nm.get_prop(ac_path, f"{NM}.Connection.Active", "Uuid") == uuid:
+                nm.manager.DeactivateConnection(ac_path)
+                nm.manager.ActivateConnection(path, "/", "/")
+                break
+
+    return await tx.run(action)
+
+@mcp.tool()
+async def delete_connection(uuid: str, ctx: Context) -> TransactionResult:
+    """
+    Deletes a connection profile by UUID.
+
+    Args:
+        uuid: UUID of the connection to delete.
+
+    Returns:
+        - status
+        - message
+    """
+    tx = NMTransaction(nm, ctx)
+
+    async def action():
+        path = nm.settings.GetConnectionByUuid(uuid)
+        nm.iface(path, f"{NM}.Settings.Connection").Delete()
 
     return await tx.run(action)
 
