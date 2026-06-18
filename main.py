@@ -147,6 +147,18 @@ class NMClient:
                 return ac_path
         return None
 
+    def build_connection_info(self, config: dict, active: bool) -> "ConnectionInfo":
+        s_con = config.get("connection", {})
+        return ConnectionInfo(
+            name=s_con.get("id"),
+            uuid=s_con.get("uuid"),
+            type=s_con.get("type"),
+            interface_name=s_con.get("interface-name"),
+            active=active,
+            ipv4=self.parse_ip_config(config.get("ipv4", {})),
+            ipv6=self.parse_ip_config(config.get("ipv6", {})),
+        )
+
 class NMTransaction:
     """Helper for safe NetworkManager changes with rollback support."""
     def __init__(self, client: NMClient, ctx: Context, timeout=60):
@@ -264,29 +276,22 @@ async def get_connections() -> list[ConnectionInfo]:
     connections = []
     for c_path in nm.settings.ListConnections():
         config = dbus_to_python(nm.iface(c_path, f"{NM}.Settings.Connection").GetSettings())
-        s_con = config.get("connection", {})
-        uuid = s_con.get("uuid")
-
-        ipv4_data = nm.parse_ip_config(config.get("ipv4", {}))
-        ipv6_data = nm.parse_ip_config(config.get("ipv6", {}))
+        uuid = config.get("connection", {}).get("uuid")
+        info = nm.build_connection_info(config, active=uuid in active_info)
 
         if uuid in active_info:
-            info = active_info[uuid]
+            ac = active_info[uuid]
             # Overlay active configuration (e.g. DHCP addresses) over stored settings
             for cfg, ip_path, iface in [
-                (ipv4_data, info["ip4"], f"{NM}.IP4Config"),
-                (ipv6_data, info["ip6"], f"{NM}.IP6Config"),
+                (info.ipv4, ac["ip4"], f"{NM}.IP4Config"),
+                (info.ipv6, ac["ip6"], f"{NM}.IP6Config"),
             ]:
                 runtime = nm.get_ip_config(ip_path, iface)
                 cfg.addresses = runtime.addresses or cfg.addresses
                 cfg.gateway = runtime.gateway or cfg.gateway
                 cfg.dns = runtime.dns or cfg.dns
 
-        connections.append(ConnectionInfo(
-            name=s_con.get("id"), uuid=uuid, type=s_con.get("type"),
-            interface_name=s_con.get("interface-name"), active=(uuid in active_info),
-            ipv4=ipv4_data, ipv6=ipv6_data
-        ))
+        connections.append(info)
 
     return connections
 
@@ -350,13 +355,7 @@ async def add_connection(
     }, signature="sa{sv}")
     path = nm.settings.AddConnection(settings)
     config = dbus_to_python(nm.iface(path, f"{NM}.Settings.Connection").GetSettings())
-    s_con_r = config.get("connection", {})
-    return ConnectionInfo(
-        name=s_con_r.get("id"), uuid=s_con_r.get("uuid"), type=s_con_r.get("type"),
-        interface_name=s_con_r.get("interface-name"), active=False,
-        ipv4=nm.parse_ip_config(config.get("ipv4", {})),
-        ipv6=nm.parse_ip_config(config.get("ipv6", {})),
-    )
+    return nm.build_connection_info(config, active=False)
 
 @mcp.tool()
 async def modify_connection(
