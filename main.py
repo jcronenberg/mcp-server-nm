@@ -129,7 +129,7 @@ class NMClient:
         if cfg.gateway:
             out["gateway"] = cfg.gateway
         if cfg.dns:
-            out["dns"] = dbus.Array(cfg.dns, signature="s")
+            out["dns-data"] = dbus.Array(cfg.dns, signature="s")
         return out
 
     def get_ip_config(self, path: str, iface_name: str) -> IPConfig:
