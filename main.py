@@ -99,10 +99,13 @@ class NMClient:
         return self.get_prop(NM_PATH, NM, "Connectivity")
 
     def parse_ip_config(self, data: dict[str, Any]) -> IPConfig:
-        """Parses D-Bus IP config data into a validated IPConfig model."""
-        # Handles both 'AddressData' (runtime) and 'address-data' (settings)
-        raw = data.get("AddressData", data.get("address-data", []))
-        dns_raw = data.get("NameserverData") or data.get("dns-data") or data.get("dns") or []
+        """Parses D-Bus IP config data into a validated IPConfig model.
+
+        Handles both runtime (AddressData/NameserverData/Gateway) and settings
+        (address-data/dns-data/gateway) shapes.
+        """
+        raw = data.get("AddressData") or data.get("address-data") or []
+        dns_raw = data.get("NameserverData") or data.get("dns-data") or []
         return IPConfig(
             method=data.get("method"),
             addresses=[f"{a['address']}/{a['prefix']}" for a in raw],
