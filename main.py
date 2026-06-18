@@ -370,7 +370,8 @@ async def modify_connection(
     """
     Updates an existing connection profile by UUID. Provided ipv4/ipv6 sections
     REPLACE the existing ones entirely, so include all fields you want to keep.
-    Re-activates the connection if it is currently active. Wrapped in a safety
+    If the connection is currently active, the new settings are reapplied to
+    each underlying device without bouncing the link. Wrapped in a safety
     checkpoint with rollback on connectivity loss.
 
     Args:
@@ -404,8 +405,8 @@ async def modify_connection(
 
         ac_path = nm.find_active_path(uuid)
         if ac_path:
-            nm.manager.DeactivateConnection(ac_path)
-            nm.manager.ActivateConnection(path, "/", "/")
+            for dev_path in nm.get_prop(ac_path, f"{NM}.Connection.Active", "Devices"):
+                nm.iface(dev_path, f"{NM}.Device").Reapply(existing, 0, 0)
 
     return await tx.run(action)
 
