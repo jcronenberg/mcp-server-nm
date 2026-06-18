@@ -43,9 +43,9 @@ class DeviceInfo(BaseModel):
 
 class IPConfig(BaseModel):
     method: str | None = None
-    addresses: list[str] = []
+    addresses: list[str] = Field(default_factory=list)
     gateway: str | None = None
-    dns: list[str] = []
+    dns: list[str] = Field(default_factory=list)
 
 class ConnectionInfo(BaseModel):
     name: str
