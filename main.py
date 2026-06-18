@@ -167,7 +167,9 @@ class NMTransaction:
 
             new_conn = self.client.get_connectivity()
 
-            if new_conn >= initial_conn:
+            # Skip the comparison if either reading is Unknown (0):
+            # NM may not have run a connectivity check yet, or the check is disabled.
+            if 0 in (initial_conn, new_conn) or new_conn >= initial_conn:
                 self.client.manager.CheckpointDestroy(self.checkpoint)
                 return TransactionResult(status="success", message="Changes applied and committed.")
 
