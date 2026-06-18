@@ -207,8 +207,18 @@ class NMTransaction:
             self.client.manager.CheckpointRollback(self.checkpoint)
             return TransactionResult(status="rollback", message="Changes rolled back by user.")
 
+        except dbus.exceptions.DBusException as e:
+            # D-Bus errors are user-visible failures (bad UUID, invalid property, etc.)
+            # Log the message only — no traceback, since this is not a server bug.
+            logger.error(f"Error during transaction: {e}")
+            if self.checkpoint:
+                try:
+                    self.client.manager.CheckpointRollback(self.checkpoint)
+                except Exception as rb_err:
+                    logger.error(f"Failed to rollback after transaction error: {rb_err}")
+            raise
         except Exception as e:
-            logger.exception(f"Error during transaction: {e}")
+            logger.exception(f"Unexpected error during transaction: {e}")
             if self.checkpoint:
                 try:
                     self.client.manager.CheckpointRollback(self.checkpoint)
