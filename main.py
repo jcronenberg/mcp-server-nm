@@ -141,6 +141,12 @@ class NMClient:
             logger.error(f"Failed to get IP config for {path}: {e}")
             return IPConfig()
 
+    def find_active_path(self, uuid: str) -> str | None:
+        for ac_path in self.get_prop(NM_PATH, NM, "ActiveConnections"):
+            if self.get_prop(ac_path, f"{NM}.Connection.Active", "Uuid") == uuid:
+                return ac_path
+        return None
+
 class NMTransaction:
     """Helper for safe NetworkManager changes with rollback support."""
     def __init__(self, client: NMClient, ctx: Context, timeout=60):
@@ -301,14 +307,13 @@ async def set_connection_state(connection_uuid: str, active: bool, ctx: Context)
     tx = NMTransaction(nm, ctx)
 
     async def action():
-        settings_path = nm.settings.GetConnectionByUuid(connection_uuid)
         if active:
+            settings_path = nm.settings.GetConnectionByUuid(connection_uuid)
             nm.manager.ActivateConnection(settings_path, "/", "/")
         else:
-            for ac_path in nm.get_prop(NM_PATH, NM, "ActiveConnections"):
-                if nm.get_prop(ac_path, f"{NM}.Connection.Active", "Uuid") == connection_uuid:
-                    nm.manager.DeactivateConnection(ac_path)
-                    break
+            ac_path = nm.find_active_path(connection_uuid)
+            if ac_path:
+                nm.manager.DeactivateConnection(ac_path)
 
     return await tx.run(action)
 
@@ -397,11 +402,10 @@ async def modify_connection(
 
         conn.Update(existing)
 
-        for ac_path in nm.get_prop(NM_PATH, NM, "ActiveConnections"):
-            if nm.get_prop(ac_path, f"{NM}.Connection.Active", "Uuid") == uuid:
-                nm.manager.DeactivateConnection(ac_path)
-                nm.manager.ActivateConnection(path, "/", "/")
-                break
+        ac_path = nm.find_active_path(uuid)
+        if ac_path:
+            nm.manager.DeactivateConnection(ac_path)
+            nm.manager.ActivateConnection(path, "/", "/")
 
     return await tx.run(action)
 
