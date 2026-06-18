@@ -325,7 +325,7 @@ async def set_connection_state(connection_uuid: str, active: bool, ctx: Context)
 @mcp.tool()
 async def add_connection(
     name: str,
-    type: str,
+    conn_type: str,
     interface_name: str | None = None,
     ipv4: IPConfig | None = None,
     ipv6: IPConfig | None = None,
@@ -335,7 +335,7 @@ async def add_connection(
 
     Args:
         name: Display name for the connection.
-        type: NM connection type string, e.g. "802-3-ethernet", "vlan", "bridge".
+        conn_type: NM connection type string, e.g. "802-3-ethernet", "vlan", "bridge".
         interface_name: Optional interface to bind the profile to.
         ipv4: IPv4 configuration. Defaults to DHCP ('auto').
         ipv6: IPv6 configuration. Defaults to autoconf ('auto').
@@ -343,13 +343,13 @@ async def add_connection(
     Returns:
         ConnectionInfo for the new profile.
     """
-    s_con = {"id": name, "type": type}
+    s_con = {"id": name, "type": conn_type}
     if interface_name:
         s_con["interface-name"] = interface_name
 
     settings = dbus.Dictionary({
         "connection": dbus.Dictionary(s_con, signature="sv"),
-        type: dbus.Dictionary({}, signature="sv"),
+        conn_type: dbus.Dictionary({}, signature="sv"),
         "ipv4": dbus.Dictionary(nm.build_ip_settings(ipv4 or IPConfig(method="auto")), signature="sv"),
         "ipv6": dbus.Dictionary(nm.build_ip_settings(ipv6 or IPConfig(method="auto")), signature="sv"),
     }, signature="sa{sv}")
@@ -360,11 +360,12 @@ async def add_connection(
 @mcp.tool()
 async def modify_connection(
     uuid: str,
-    ctx: Context,
     name: str | None = None,
     interface_name: str | None = None,
     ipv4: IPConfig | None = None,
     ipv6: IPConfig | None = None,
+    *,
+    ctx: Context,
 ) -> TransactionResult:
     """
     Updates an existing connection profile by UUID. Provided ipv4/ipv6 sections
