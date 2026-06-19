@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Runner for the NetworkManager MCP server test suite.
 
 Usage:

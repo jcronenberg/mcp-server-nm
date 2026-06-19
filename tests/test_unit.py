@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for pure functions in main.py — no NetworkManager or root required."""
 
 import os

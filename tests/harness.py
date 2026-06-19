@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared harness for the NetworkManager MCP server test suite."""
 
 import asyncio
