@@ -106,11 +106,21 @@ class NMClient:
         """
         raw = data.get("AddressData") or data.get("address-data") or []
         dns_raw = data.get("NameserverData") or data.get("dns-data") or []
+
+        addresses = [f"{a['address']}/{a['prefix']}" for a in raw]
+
+        dns = []
+        for d in dns_raw:
+            if isinstance(d, dict):
+                dns.append(d["address"])
+            else:
+                dns.append(d)
+
         return IPConfig(
             method=data.get("method"),
-            addresses=[f"{a['address']}/{a['prefix']}" for a in raw],
+            addresses=addresses,
             gateway=data.get("Gateway") or data.get("gateway"),
-            dns=[d["address"] if isinstance(d, dict) else d for d in dns_raw],
+            dns=dns,
         )
 
     def build_ip_settings(self, cfg: IPConfig) -> dict:
@@ -119,13 +129,14 @@ class NMClient:
         if cfg.method:
             out["method"] = cfg.method
         if cfg.addresses:
-            out["address-data"] = dbus.Array([
-                dbus.Dictionary({
-                    "address": addr.split("/")[0],
-                    "prefix": dbus.UInt32(int(addr.split("/")[1])),
-                }, signature="sv")
-                for addr in cfg.addresses
-            ], signature="a{sv}")
+            addr_list = []
+            for addr in cfg.addresses:
+                host, prefix = addr.split("/", 1)
+                addr_list.append(dbus.Dictionary({
+                    "address": host,
+                    "prefix": dbus.UInt32(int(prefix)),
+                }, signature="sv"))
+            out["address-data"] = dbus.Array(addr_list, signature="a{sv}")
         if cfg.gateway:
             out["gateway"] = cfg.gateway
         if cfg.dns:
@@ -211,20 +222,19 @@ class NMTransaction:
             # D-Bus errors are user-visible failures (bad UUID, invalid property, etc.)
             # Log the message only — no traceback, since this is not a server bug.
             logger.error(f"Error during transaction: {e}")
-            if self.checkpoint:
-                try:
-                    self.client.manager.CheckpointRollback(self.checkpoint)
-                except Exception as rb_err:
-                    logger.error(f"Failed to rollback after transaction error: {rb_err}")
+            self._rollback()
             raise
         except Exception as e:
             logger.exception(f"Unexpected error during transaction: {e}")
-            if self.checkpoint:
-                try:
-                    self.client.manager.CheckpointRollback(self.checkpoint)
-                except Exception as rb_err:
-                    logger.error(f"Failed to rollback after transaction error: {rb_err}")
+            self._rollback()
             raise
+
+    def _rollback(self):
+        if self.checkpoint:
+            try:
+                self.client.manager.CheckpointRollback(self.checkpoint)
+            except Exception as rb_err:
+                logger.error(f"Failed to rollback after transaction error: {rb_err}")
 
 mcp = FastMCP("NetworkManager MCP Server")
 nm = NMClient()
@@ -291,15 +301,23 @@ async def get_connections() -> list[ConnectionInfo]:
 
         if uuid in active_info:
             ac = active_info[uuid]
-            # Overlay active configuration (e.g. DHCP addresses) over stored settings
-            for cfg, ip_path, iface in [
-                (info.ipv4, ac["ip4"], f"{NM}.IP4Config"),
-                (info.ipv6, ac["ip6"], f"{NM}.IP6Config"),
-            ]:
-                runtime = nm.get_ip_config(ip_path, iface)
-                cfg.addresses = runtime.addresses or cfg.addresses
-                cfg.gateway = runtime.gateway or cfg.gateway
-                cfg.dns = runtime.dns or cfg.dns
+            # Overlay active runtime values over stored settings.
+            # Only overlay when there is an actual IP config object (path != "/");
+            # use runtime values directly so that empty lists aren't mistaken for
+            # "no data" and replaced by stale stored-settings values.
+            ip4_path = ac["ip4"]
+            if ip4_path != "/":
+                runtime4 = nm.get_ip_config(ip4_path, f"{NM}.IP4Config")
+                info.ipv4.addresses = runtime4.addresses
+                info.ipv4.gateway = runtime4.gateway
+                info.ipv4.dns = runtime4.dns
+
+            ip6_path = ac["ip6"]
+            if ip6_path != "/":
+                runtime6 = nm.get_ip_config(ip6_path, f"{NM}.IP6Config")
+                info.ipv6.addresses = runtime6.addresses
+                info.ipv6.gateway = runtime6.gateway
+                info.ipv6.dns = runtime6.dns
 
         connections.append(info)
 
@@ -353,6 +371,11 @@ async def add_connection(
     Returns:
         ConnectionInfo for the new profile.
     """
+    if ipv4 is None:
+        ipv4 = IPConfig(method="auto")
+    if ipv6 is None:
+        ipv6 = IPConfig(method="auto")
+
     s_con = {"id": name, "type": conn_type}
     if interface_name:
         s_con["interface-name"] = interface_name
@@ -360,8 +383,8 @@ async def add_connection(
     settings = dbus.Dictionary({
         "connection": dbus.Dictionary(s_con, signature="sv"),
         conn_type: dbus.Dictionary({}, signature="sv"),
-        "ipv4": dbus.Dictionary(nm.build_ip_settings(ipv4 or IPConfig(method="auto")), signature="sv"),
-        "ipv6": dbus.Dictionary(nm.build_ip_settings(ipv6 or IPConfig(method="auto")), signature="sv"),
+        "ipv4": dbus.Dictionary(nm.build_ip_settings(ipv4), signature="sv"),
+        "ipv6": dbus.Dictionary(nm.build_ip_settings(ipv6), signature="sv"),
     }, signature="sa{sv}")
     path = nm.settings.AddConnection(settings)
     config = dbus_to_python(nm.iface(path, f"{NM}.Settings.Connection").GetSettings())
