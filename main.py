@@ -237,7 +237,6 @@ class NMTransaction:
                 logger.error(f"Failed to rollback after transaction error: {rb_err}")
 
 mcp = FastMCP("NetworkManager MCP Server")
-nm = NMClient()
 
 @mcp.tool()
 async def get_connectivity() -> str:
@@ -486,4 +485,5 @@ async def set_hostname(hostname: str) -> TransactionResult:
     return TransactionResult(status="success", message=f"Hostname set to '{hostname}'.")
 
 if __name__ == "__main__":
+    nm = NMClient()
     mcp.run(transport="stdio")
