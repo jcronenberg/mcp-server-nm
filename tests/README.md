@@ -10,22 +10,17 @@
 ## Running
 
 ```
-sudo python3 tests/run_tests.py              # all tests
-sudo python3 tests/run_tests.py -v           # all tests, verbose
-sudo python3 tests/run_tests.py get_devices  # single test (test_ prefix optional)
-sudo python3 tests/run_tests.py get_devices get_connections -v  # multiple, verbose
+make test
+```
+
+To use a custom server binary, set `NM_MCP_TEST_SERVER` (default: `uv run main.py`):
+
+```
+NM_MCP_TEST_SERVER="python3 main.py" make test
 ```
 
 Individual test files can also be run directly:
 
 ```
-sudo python3 tests/test_get_connectivity.py [-v]
-```
-
-## Server binary
-
-Set `NM_MCP_TEST_SERVER` to override the default `uv run main.py`:
-
-```
-sudo NM_MCP_TEST_SERVER="python3 main.py" python3 tests/run_tests.py
+python3 tests/test_get_connectivity.py [-v]
 ```
