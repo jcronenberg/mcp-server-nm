@@ -2,7 +2,6 @@
 
 import dbus
 import asyncio
-import logging
 from typing import Any
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
@@ -140,11 +139,7 @@ class NMClient:
     def get_ip_config(self, path: str, iface_name: str) -> IPConfig:
         if path == "/":
             return IPConfig()
-        try:
-            return self.parse_ip_config(self.get_all(path, iface_name))
-        except Exception as e:
-            logger.error(f"Failed to get IP config for {path}: {e}")
-            return IPConfig()
+        return self.parse_ip_config(self.get_all(path, iface_name))
 
     def find_active_path(self, uuid: str) -> str | None:
         for ac_path in self.get_prop(NM_PATH, NM, "ActiveConnections"):
@@ -212,23 +207,13 @@ class NMTransaction:
             self.client.manager.CheckpointRollback(self.checkpoint)
             return TransactionResult(status="rollback", message="Changes rolled back by user.")
 
-        except dbus.exceptions.DBusException as e:
-            # D-Bus errors are user-visible failures (bad UUID, invalid property, etc.)
-            # Log the message only — no traceback, since this is not a server bug.
-            logger.error(f"Error during transaction: {e}")
-            self._rollback()
-            raise
-        except Exception as e:
-            logger.exception(f"Unexpected error during transaction: {e}")
+        except Exception:
             self._rollback()
             raise
 
     def _rollback(self):
         if self.checkpoint:
-            try:
-                self.client.manager.CheckpointRollback(self.checkpoint)
-            except Exception as rb_err:
-                logger.error(f"Failed to rollback after transaction error: {rb_err}")
+            self.client.manager.CheckpointRollback(self.checkpoint)
 
 mcp = FastMCP("NetworkManager MCP Server")
 
