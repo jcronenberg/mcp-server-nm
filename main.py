@@ -8,12 +8,6 @@ from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import PingRequest, EmptyResult, ClientCapabilities, ElicitationCapability
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(levelname)s: %(name)s - %(message)s'
-)
-logger = logging.getLogger("mcp-server-nm")
-
 NM = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
 PROPS = "org.freedesktop.DBus.Properties"
