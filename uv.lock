@@ -1,6 +1,6 @@
 version = 1
 revision = 3
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 
 [[package]]
 name = "annotated-types"
@@ -273,7 +273,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "dbus-python", specifier = ">=1.4.0" },
-    { name = "mcp", specifier = ">=1.2.0" },
+    { name = "mcp", specifier = ">=1.10.0" },
 ]
 
 [[package]]
