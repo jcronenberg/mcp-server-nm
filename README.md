@@ -11,17 +11,17 @@ uv run main.py
 ## Tools
 
 **Read-only**
-- `get_connectivity` — global network connectivity state
-- `get_devices` — list network devices (interface, type, state, MAC address)
-- `get_connections` — list configured connection profiles with IPv4/IPv6 config
-- `get_hostname` — persistent system hostname
+- `get_connectivity` - global network connectivity state
+- `get_devices` - list network devices (interface, type, state, MAC address)
+- `get_connections` - list configured connection profiles with IPv4/IPv6 config
+- `get_hostname` - persistent system hostname
 
 **Mutating**
-- `set_connection_state` — activate or deactivate a connection profile by UUID
-- `add_connection` — create a new connection profile
-- `modify_connection` — update an existing connection profile by UUID
-- `delete_connection` — delete a connection profile by UUID
-- `set_hostname` — set the persistent system hostname
+- `set_connection_state` - activate or deactivate a connection profile by UUID
+- `add_connection` - create a new connection profile
+- `modify_connection` - update an existing connection profile by UUID
+- `delete_connection` - delete a connection profile by UUID
+- `set_hostname` - set the persistent system hostname
 
 ## Safety features
 
